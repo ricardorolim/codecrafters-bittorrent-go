@@ -1,7 +1,6 @@
 package main
 
 import (
-	// Uncomment this line to pass the first stage
 	"encoding/json"
 	"fmt"
 	"os"
@@ -32,6 +31,14 @@ func decodeBencode(bencodedString string) (interface{}, error) {
 		}
 
 		return bencodedString[firstColonIndex+1 : firstColonIndex+1+length], nil
+	} else if bencodedString[0] == 'i' {
+		length := len(bencodedString)
+
+		if bencodedString[length-1] != 'e' {
+			return "", fmt.Errorf("Invalid bencoded integer")
+		}
+
+		return strconv.Atoi(bencodedString[1:length - 1])
 	} else {
 		return "", fmt.Errorf("Only strings are supported at the moment")
 	}
