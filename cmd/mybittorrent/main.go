@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"unicode"
 	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
@@ -12,35 +14,86 @@ import (
 // Example:
 // - 5:hello -> hello
 // - 10:hello12345 -> hello12345
-func decodeBencode(bencodedString string) (interface{}, error) {
-	if unicode.IsDigit(rune(bencodedString[0])) {
-		var firstColonIndex int
-
-		for i := 0; i < len(bencodedString); i++ {
-			if bencodedString[i] == ':' {
-				firstColonIndex = i
-				break
-			}
+func decodeBencode(bencodedReader *bufio.Reader) (interface{}, error) {
+	for {
+		peeked, err := bencodedReader.Peek(1)
+		if err != nil {
+			return nil, err
 		}
 
-		lengthStr := bencodedString[:firstColonIndex]
+		if peeked[0] == 'l' {
+			if _, err := bencodedReader.Discard(1); err != nil {
+				return 0, err
+			}
 
-		length, err := strconv.Atoi(lengthStr)
+			decoded := []interface{}{}
+
+			for {
+				peeked, err := bencodedReader.Peek(1)
+				if err != nil {
+					return nil, err
+				}
+
+				if peeked[0] == 'e' {
+					if _, err := bencodedReader.Discard(1); err != nil {
+						return 0, err
+					}
+
+					return decoded, nil
+				}
+
+				item, err := decodeBencode(bencodedReader)
+				if err != nil {
+					return nil, err
+				}
+
+				decoded = append(decoded, item)
+			}
+		} else {
+			return decodePrimitive(bencodedReader)
+		}
+	}
+}
+
+func decodePrimitive(bencodedReader *bufio.Reader) (interface{}, error) {
+	peeked, err := bencodedReader.Peek(1)
+	if err != nil {
+		return nil, err
+	}
+	r := peeked[0]
+
+	if unicode.IsDigit(rune(r)) {
+		lengthStr, err := bencodedReader.ReadString(':')
 		if err != nil {
 			return "", err
 		}
 
-		return bencodedString[firstColonIndex+1 : firstColonIndex+1+length], nil
-	} else if bencodedString[0] == 'i' {
-		length := len(bencodedString)
-
-		if bencodedString[length-1] != 'e' {
-			return "", fmt.Errorf("Invalid bencoded integer")
+		l := len(lengthStr)
+		length, err := strconv.Atoi(lengthStr[:l - 1])
+		if err != nil {
+			return "", err
 		}
 
-		return strconv.Atoi(bencodedString[1:length - 1])
+		var decodedString = make([]byte, length)
+		if _, err := bencodedReader.Read(decodedString); err != nil {
+			return "", err
+		}
+
+		return string(decodedString), nil
+	} else if r == 'i' {
+		if _, err := bencodedReader.Discard(1); err != nil {
+			return 0, err
+		}
+
+		intStr, err := bencodedReader.ReadString('e')
+		if err != nil {
+			return 0, err
+		}
+
+		l := len(intStr)
+		return strconv.Atoi(intStr[:l - 1])
 	} else {
-		return "", fmt.Errorf("Only strings are supported at the moment")
+		return nil, fmt.Errorf("Unrecognized primitive")
 	}
 }
 
@@ -48,7 +101,7 @@ func main() {
 	command := os.Args[1]
 
 	if command == "decode" {
-		bencodedValue := os.Args[2]
+		bencodedValue := bufio.NewReader(strings.NewReader(os.Args[2]))
 
 		decoded, err := decodeBencode(bencodedValue)
 		if err != nil {
