@@ -159,6 +159,41 @@ func main() {
 
 		jsonOutput, _ := json.Marshal(decoded)
 		fmt.Println(string(jsonOutput))
+	} else if command == "info" {
+		if len(os.Args) < 3 {
+			fmt.Printf("usage: %s info filename\n", os.Args[0])
+			os.Exit(1)
+		}
+
+		f, err := os.Open(os.Args[2])
+		defer f.Close()
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+	    }
+
+		decoded, err := decodeBencode(bufio.NewReader(f))
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		var metainfo struct {
+			Announce string
+			Info struct {
+				Length uint64
+				Name string
+				PieceLength uint64 `json:"piece length"`
+				Pieces []byte
+			}
+		}
+
+		jsonOutput, _ := json.Marshal(decoded)
+		json.Unmarshal(jsonOutput, &metainfo)
+
+		fmt.Println("Tracker URL:", metainfo.Announce)
+		fmt.Println("Length:", metainfo.Info.Length)
+
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
