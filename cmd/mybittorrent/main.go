@@ -152,6 +152,8 @@ type InfoMap struct {
 	Name string
 	PieceLength int
 	Pieces string
+	PieceSlice []string
+	infohash []byte
 }
 
 func NewInfoMap(info map[string]any) (InfoMap, error) {
@@ -174,22 +176,32 @@ func NewInfoMap(info map[string]any) (InfoMap, error) {
 	if !ok {
 		return InfoMap{}, fmt.Errorf("unexpected type for %v", info["pieces"])
 	}
-
-	return InfoMap {
+	
+	infoMap := InfoMap {
 		Length: length,
 		Name: name,
 		PieceLength: pieceLength,
 		Pieces: pieces,
-	}, nil
+	}
+
+	var err error
+	infoMap.infohash, err = infoMap.Hash()
+	if err != nil {
+		return InfoMap{}, err
+	}
+
+	return infoMap, nil
 }
 
-func (i *InfoMap) Map() map[string]any {
-	return map[string]interface{} {
-		"length": i.Length,
-		"name": i.Name,
-		"piece length": i.PieceLength,
-		"pieces": i.Pieces,
+func (m *InfoMap) Hash() ([]byte, error) {
+	encoded, err := m.Encode()
+	if err != nil {
+		return nil, err
 	}
+
+	h := sha1.New()
+	h.Write([]byte(encoded))
+	return h.Sum(nil), nil
 }
 
 func (m *InfoMap) Encode() (string, error) {
@@ -224,6 +236,25 @@ func (m *InfoMap) Encode() (string, error) {
 	return encoded, nil
 }
 
+func (i *InfoMap) Map() map[string]any {
+	return map[string]interface{} {
+		"length": i.Length,
+		"name": i.Name,
+		"piece length": i.PieceLength,
+		"pieces": i.Pieces,
+	}
+}
+
+func (m *InfoMap) PieceHashes() []string {
+	var hashes = make([]string, 0)
+
+	for i := 0; i < len(m.Pieces); i += 20 {
+		hashes = append(hashes, m.Pieces[i : i + 20])
+	}
+
+	return hashes
+}
+
 type MetaInfo struct {
 	Announce string
 	Info InfoMap
@@ -251,15 +282,17 @@ func NewMetaInfo(decoded map[string]any) (MetaInfo, error) {
 	}, nil
 }
 
-func (m *MetaInfo) Hash() ([]byte, error) {
-	encoded, err := m.Info.Encode()
-	if err != nil {
-		return nil, err
+func (m MetaInfo) String() string {
+	s := fmt.Sprintln("Tracker URL:", m.Announce)
+	s += fmt.Sprintln("Length:", m.Info.Length)
+	s += fmt.Sprintln("Info Hash:", fmt.Sprintf("%x", m.Info.infohash))
+	s += fmt.Sprintln("Piece Length:", m.Info.PieceLength)
+	s += fmt.Sprintln("Piece Hashes:")
+	for _, hash := range m.Info.PieceHashes() {
+		s += fmt.Sprintln(fmt.Sprintf("%x", hash))
 	}
 
-	h := sha1.New()
-	h.Write([]byte(encoded))
-	return h.Sum(nil), nil
+	return s
 }
 
 func main() {
@@ -307,15 +340,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		sha1, err := metainfo.Hash()
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
-
-		fmt.Println("Tracker URL:", metainfo.Announce)
-		fmt.Println("Length:", metainfo.Info.Length)
-		fmt.Println("Info Hash:", fmt.Sprintf("%x", sha1))
+		fmt.Print(metainfo)
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
