@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha1"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -145,6 +147,121 @@ func decodeString(bencodedReader *bufio.Reader) (string, error) {
 	return string(decodedString), nil
 }
 
+type InfoMap struct {
+	Length int
+	Name string
+	PieceLength int
+	Pieces string
+}
+
+func NewInfoMap(info map[string]any) (InfoMap, error) {
+	length, ok := info["length"].(int)
+	if !ok {
+		return InfoMap{}, fmt.Errorf("unexpected type for %v", info["length"])
+	}
+
+	name, ok := info["name"].(string)
+	if !ok {
+		return InfoMap{}, fmt.Errorf("unexpected type for %v", info["name"])
+	}
+
+	pieceLength, ok := info["piece length"].(int)
+	if !ok {
+		return InfoMap{}, fmt.Errorf("unexpected type for %v", info["piece length"])
+	}
+
+	pieces, ok := info["pieces"].(string)
+	if !ok {
+		return InfoMap{}, fmt.Errorf("unexpected type for %v", info["pieces"])
+	}
+
+	return InfoMap {
+		Length: length,
+		Name: name,
+		PieceLength: pieceLength,
+		Pieces: pieces,
+	}, nil
+}
+
+func (i *InfoMap) Map() map[string]any {
+	return map[string]interface{} {
+		"length": i.Length,
+		"name": i.Name,
+		"piece length": i.PieceLength,
+		"pieces": i.Pieces,
+	}
+}
+
+func (m *InfoMap) Encode() (string, error) {
+	strs := []string{}
+
+	kvpairs := m.Map()
+	keys := make([]string, 0, len(kvpairs))
+
+	for k := range kvpairs {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		strs = append(strs, fmt.Sprintf("%d:%s", len(k), k))
+		v := kvpairs[k]
+
+		switch v := v.(type) {
+		case int:
+			n := fmt.Sprintf("i%de", v)
+			strs = append(strs, n)
+		case string:
+			s := fmt.Sprintf("%d:%s", len(v), v)
+			strs = append(strs, s)
+		default:
+			return "", errors.New("unknown encoding type")
+		}
+	}
+
+	encoded := fmt.Sprintf("d%se", strings.Join(strs, ""))
+	return encoded, nil
+}
+
+type MetaInfo struct {
+	Announce string
+	Info InfoMap
+}
+
+func NewMetaInfo(decoded map[string]any) (MetaInfo, error) {
+	announce, ok := decoded["announce"].(string)
+	if !ok {
+		return MetaInfo{}, fmt.Errorf("unexpected type for %v", decoded["announce"])
+	}
+
+	info, ok := decoded["info"].(map[string]any)
+	if !ok {
+		return MetaInfo{}, fmt.Errorf("unexpected type for %v", decoded["info"])
+	}
+
+	infomap, err := NewInfoMap(info)
+	if err != nil {
+		return MetaInfo{}, err
+	}
+
+	return MetaInfo {
+		Announce: announce,
+		Info: infomap,
+	}, nil
+}
+
+func (m *MetaInfo) Hash() ([]byte, error) {
+	encoded, err := m.Info.Encode()
+	if err != nil {
+		return nil, err
+	}
+
+	h := sha1.New()
+	h.Write([]byte(encoded))
+	return h.Sum(nil), nil
+}
+
 func main() {
 	command := os.Args[1]
 
@@ -178,22 +295,27 @@ func main() {
 			return
 		}
 
-		var metainfo struct {
-			Announce string
-			Info struct {
-				Length uint64
-				Name string
-				PieceLength uint64 `json:"piece length"`
-				Pieces []byte
-			}
+		decoded_map, ok := decoded.(map[string]any)
+		if !ok {
+			fmt.Printf("unexpected type for %v\n", decoded);
+			os.Exit(1)
 		}
 
-		jsonOutput, _ := json.Marshal(decoded)
-		json.Unmarshal(jsonOutput, &metainfo)
+		metainfo, err := NewMetaInfo(decoded_map)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+
+		sha1, err := metainfo.Hash()
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
 
 		fmt.Println("Tracker URL:", metainfo.Announce)
 		fmt.Println("Length:", metainfo.Info.Length)
-
+		fmt.Println("Info Hash:", fmt.Sprintf("%x", sha1))
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
