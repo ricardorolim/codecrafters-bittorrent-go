@@ -2,14 +2,20 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
@@ -112,7 +118,7 @@ func decodePrimitive(bencodedReader *bufio.Reader) (interface{}, error) {
 		}
 
 		l := len(intStr)
-		return strconv.Atoi(intStr[:l - 1])
+		return strconv.Atoi(intStr[:l-1])
 	} else {
 		return nil, fmt.Errorf("Unrecognized primitive")
 	}
@@ -134,7 +140,7 @@ func decodeString(bencodedReader *bufio.Reader) (string, error) {
 	}
 
 	l := len(lengthStr)
-	length, err := strconv.Atoi(lengthStr[:l - 1])
+	length, err := strconv.Atoi(lengthStr[:l-1])
 	if err != nil {
 		return "", err
 	}
@@ -148,12 +154,12 @@ func decodeString(bencodedReader *bufio.Reader) (string, error) {
 }
 
 type InfoMap struct {
-	Length int
-	Name string
+	Length      int
+	Name        string
 	PieceLength int
-	Pieces string
-	PieceSlice []string
-	infohash []byte
+	Pieces      string
+	PieceSlice  []string
+	infohash    []byte
 }
 
 func NewInfoMap(info map[string]any) (InfoMap, error) {
@@ -176,12 +182,12 @@ func NewInfoMap(info map[string]any) (InfoMap, error) {
 	if !ok {
 		return InfoMap{}, fmt.Errorf("unexpected type for %v", info["pieces"])
 	}
-	
-	infoMap := InfoMap {
-		Length: length,
-		Name: name,
+
+	infoMap := InfoMap{
+		Length:      length,
+		Name:        name,
 		PieceLength: pieceLength,
-		Pieces: pieces,
+		Pieces:      pieces,
 	}
 
 	var err error
@@ -237,11 +243,11 @@ func (m *InfoMap) Encode() (string, error) {
 }
 
 func (i *InfoMap) Map() map[string]any {
-	return map[string]interface{} {
-		"length": i.Length,
-		"name": i.Name,
+	return map[string]interface{}{
+		"length":       i.Length,
+		"name":         i.Name,
 		"piece length": i.PieceLength,
-		"pieces": i.Pieces,
+		"pieces":       i.Pieces,
 	}
 }
 
@@ -249,7 +255,7 @@ func (m *InfoMap) PieceHashes() []string {
 	var hashes = make([]string, 0)
 
 	for i := 0; i < len(m.Pieces); i += 20 {
-		hashes = append(hashes, m.Pieces[i : i + 20])
+		hashes = append(hashes, m.Pieces[i:i+20])
 	}
 
 	return hashes
@@ -257,7 +263,7 @@ func (m *InfoMap) PieceHashes() []string {
 
 type MetaInfo struct {
 	Announce string
-	Info InfoMap
+	Info     InfoMap
 }
 
 func NewMetaInfo(decoded map[string]any) (MetaInfo, error) {
@@ -276,9 +282,9 @@ func NewMetaInfo(decoded map[string]any) (MetaInfo, error) {
 		return MetaInfo{}, err
 	}
 
-	return MetaInfo {
+	return MetaInfo{
 		Announce: announce,
-		Info: infomap,
+		Info:     infomap,
 	}, nil
 }
 
@@ -293,6 +299,85 @@ func (m MetaInfo) String() string {
 	}
 
 	return s
+}
+
+func readMetaInfo(filename string) (MetaInfo, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return MetaInfo{}, err
+	}
+	defer f.Close()
+
+	decoded, err := decodeBencode(bufio.NewReader(f))
+	if err != nil {
+		return MetaInfo{}, err
+	}
+
+	decoded_map, ok := decoded.(map[string]any)
+	if !ok {
+		fmt.Printf("unexpected type for %v\n", decoded)
+		os.Exit(1)
+	}
+
+	return NewMetaInfo(decoded_map)
+}
+
+func listPeers(filename string) error {
+	metainfo, err := readMetaInfo(filename)
+	if err != nil {
+		return err
+	}
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequestWithContext(
+		context.Background(), http.MethodGet, metainfo.Announce, nil)
+	if err != nil {
+		return err
+	}
+
+	q := req.URL.Query()
+	q.Add("info_hash", string(metainfo.Info.infohash))
+	q.Add("peer_id", "00112233445566778899")
+	q.Add("port", strconv.Itoa(6881))
+	q.Add("uploaded", strconv.Itoa(0))
+	q.Add("downloaded", strconv.Itoa(0))
+	q.Add("left", strconv.Itoa(metainfo.Info.Length))
+	q.Add("compact", strconv.Itoa(1))
+
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	bodyReader := bufio.NewReader(resp.Body)
+	decoded, err := decodeBencode(bodyReader)
+	if err != nil {
+		return err
+	}
+
+	resp_map, ok := decoded.(map[string]any)
+	if !ok {
+		return fmt.Errorf("Unexpected type for response: %v\n", decoded)
+	}
+
+	peers, ok := resp_map["peers"].(string)
+	if !ok {
+		return fmt.Errorf("Unexpected type for 'peers' in response: %v\n", peers)
+	}
+
+	for i := 0; i < len(peers); i += 6 {
+		peer := peers[i : i+6]
+		address := net.IPv4(peer[0], peer[1], peer[2], peer[3])
+		port := binary.BigEndian.Uint16([]byte(peer[4:6]))
+		fmt.Println(fmt.Sprintf("%s:%d", address, port))
+	}
+
+	return nil
 }
 
 func main() {
@@ -315,32 +400,21 @@ func main() {
 			os.Exit(1)
 		}
 
-		f, err := os.Open(os.Args[2])
-		defer f.Close()
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-	    }
-
-		decoded, err := decodeBencode(bufio.NewReader(f))
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		decoded_map, ok := decoded.(map[string]any)
-		if !ok {
-			fmt.Printf("unexpected type for %v\n", decoded);
-			os.Exit(1)
-		}
-
-		metainfo, err := NewMetaInfo(decoded_map)
+		metainfo, err := readMetaInfo(os.Args[2])
 		if err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
 
 		fmt.Print(metainfo)
+	} else if command == "peers" {
+		if len(os.Args) < 3 {
+			log.Fatalf("usage: %s peers filename\n", os.Args[0])
+		}
+
+		if err := listPeers(os.Args[2]); err != nil {
+			log.Fatal(err)
+		}
 	} else {
 		fmt.Println("Unknown command: " + command)
 		os.Exit(1)
