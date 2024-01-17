@@ -380,6 +380,42 @@ func listPeers(filename string) error {
 	return nil
 }
 
+func handshake(filename string, peer string) error {
+	metainfo, err := readMetaInfo(filename)
+	if err != nil {
+		return err
+	}
+
+	conn, err := net.Dial("tcp", peer)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	var msg []byte
+	msg = append(msg, 19)
+	msg = append(msg, []byte("BitTorrent protocol")...)
+	msg = append(msg, make([]byte, 8)...)
+	msg = append(msg, metainfo.Info.infohash...)
+	msg = append(msg, []byte("00112233445566778899")...)
+	if _, err := conn.Write(msg); err != nil {
+		return err
+	}
+
+	if _, err := conn.Read(msg); err != nil {
+		return err
+	}
+
+	// length := msg[0:1]
+	// protocolStr := msg[1:20]
+	// reserved := msg[20:28]
+	// infohash := msg[28:48]
+	peerId := msg[48:68]
+
+	fmt.Printf("Peer ID: %0x\n", peerId)
+	return nil
+}
+
 func main() {
 	command := os.Args[1]
 
@@ -388,31 +424,36 @@ func main() {
 
 		decoded, err := decodeBencode(bencodedValue)
 		if err != nil {
-			fmt.Println(err)
-			return
+			log.Fatal(err)
 		}
 
 		jsonOutput, _ := json.Marshal(decoded)
 		fmt.Println(string(jsonOutput))
 	} else if command == "info" {
 		if len(os.Args) < 3 {
-			fmt.Printf("usage: %s info filename\n", os.Args[0])
-			os.Exit(1)
+			log.Fatalf("usage: %s %s filename\n", os.Args[0], command)
 		}
 
 		metainfo, err := readMetaInfo(os.Args[2])
 		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+			log.Fatal(err)
 		}
 
 		fmt.Print(metainfo)
 	} else if command == "peers" {
 		if len(os.Args) < 3 {
-			log.Fatalf("usage: %s peers filename\n", os.Args[0])
+			log.Fatalf("usage: %s %s filename\n", os.Args[0], command)
 		}
 
 		if err := listPeers(os.Args[2]); err != nil {
+			log.Fatal(err)
+		}
+	} else if command == "handshake" {
+		if len(os.Args) < 4 {
+			log.Fatalf("usage: %s %s filename peer_ip:peer_port\n", os.Args[0], command)
+		}
+
+		if err := handshake(os.Args[2], os.Args[3]); err != nil {
 			log.Fatal(err)
 		}
 	} else {
