@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -17,7 +19,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-	// bencode "github.com/jackpal/bencode-go" // Available if you need it!
 )
 
 // Example:
@@ -315,19 +316,13 @@ func readMetaInfo(filename string) (MetaInfo, error) {
 
 	decoded_map, ok := decoded.(map[string]any)
 	if !ok {
-		fmt.Printf("unexpected type for %v\n", decoded)
-		os.Exit(1)
+		return MetaInfo{}, err
 	}
 
 	return NewMetaInfo(decoded_map)
 }
 
-func listPeers(filename string) error {
-	metainfo, err := readMetaInfo(filename)
-	if err != nil {
-		return err
-	}
-
+func peers(metainfo MetaInfo) ([]string, error) {
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
@@ -335,7 +330,7 @@ func listPeers(filename string) error {
 	req, err := http.NewRequestWithContext(
 		context.Background(), http.MethodGet, metainfo.Announce, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	q := req.URL.Query()
@@ -351,30 +346,49 @@ func listPeers(filename string) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	bodyReader := bufio.NewReader(resp.Body)
 	decoded, err := decodeBencode(bodyReader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	resp_map, ok := decoded.(map[string]any)
 	if !ok {
-		return fmt.Errorf("Unexpected type for response: %v\n", decoded)
+		return nil, fmt.Errorf("Unexpected type for response: %v\n", decoded)
 	}
 
 	peers, ok := resp_map["peers"].(string)
 	if !ok {
-		return fmt.Errorf("Unexpected type for 'peers' in response: %v\n", peers)
+		return nil, fmt.Errorf("Unexpected type for 'peers' in response: %v\n", peers)
 	}
 
+	var peerSlice []string
 	for i := 0; i < len(peers); i += 6 {
 		peer := peers[i : i+6]
 		address := net.IPv4(peer[0], peer[1], peer[2], peer[3])
 		port := binary.BigEndian.Uint16([]byte(peer[4:6]))
-		fmt.Println(fmt.Sprintf("%s:%d", address, port))
+		peerSlice = append(peerSlice, fmt.Sprintf("%s:%d", address, port))
+	}
+
+	return peerSlice, nil
+}
+
+func listPeers(filename string) error {
+	metainfo, err := readMetaInfo(filename)
+	if err != nil {
+		return err
+	}
+
+	peers, err := peers(metainfo)
+	if err != nil {
+		return err
+	}
+
+	for _, peer := range peers {
+		fmt.Println(peer)
 	}
 
 	return nil
@@ -392,6 +406,16 @@ func handshake(filename string, peer string) error {
 	}
 	defer conn.Close()
 
+	peerId, err := handshakeConn(conn, metainfo)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Peer ID: %0x\n", peerId)
+	return nil
+}
+
+func handshakeConn(conn net.Conn, metainfo MetaInfo) ([]byte, error) {
 	var msg []byte
 	msg = append(msg, 19)
 	msg = append(msg, []byte("BitTorrent protocol")...)
@@ -399,11 +423,11 @@ func handshake(filename string, peer string) error {
 	msg = append(msg, metainfo.Info.infohash...)
 	msg = append(msg, []byte("00112233445566778899")...)
 	if _, err := conn.Write(msg); err != nil {
-		return err
+		return nil, err
 	}
 
 	if _, err := conn.Read(msg); err != nil {
-		return err
+		return nil, err
 	}
 
 	// length := msg[0:1]
@@ -412,14 +436,173 @@ func handshake(filename string, peer string) error {
 	// infohash := msg[28:48]
 	peerId := msg[48:68]
 
-	fmt.Printf("Peer ID: %0x\n", peerId)
+	return peerId, nil
+}
+
+func download_piece(outputFile string, torrentFile string, pieceNum int) error {
+	metainfo, err := readMetaInfo(torrentFile)
+	if err != nil {
+		return err
+	}
+
+	peers, err := peers(metainfo)
+	if err != nil {
+		return err
+	}
+
+	if len(peers) == 0 {
+		return errors.New("no peers found")
+	}
+
+	conn, err := net.Dial("tcp", peers[0])
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err := handshakeConn(conn, metainfo); err != nil {
+		return err
+	}
+
+	msg, err := readPeerMsg(conn, BitField)
+	if err != nil {
+		return err
+	}
+
+	msg = NewPeerMsg(Interested)
+	if _, err := conn.Write(msg.Bytes()); err != nil {
+		return err
+	}
+
+	msg, err = readPeerMsg(conn, Unchoke)
+	if err != nil {
+		return err
+	}
+
+	torrentPieceHash := metainfo.Info.PieceHashes()[pieceNum]
+	maxlen := metainfo.Info.Length - (pieceNum * metainfo.Info.PieceLength)
+	blklen := 1 << 14;
+	var piece []byte
+
+	for i := 0; i < metainfo.Info.PieceLength; i += blklen {
+		length := math.Min(float64(maxlen - i), float64(blklen))
+
+		payload := make([]byte, 12)
+		binary.BigEndian.PutUint32(payload[0:4], uint32(pieceNum))
+		binary.BigEndian.PutUint32(payload[4:8], uint32(i))
+		binary.BigEndian.PutUint32(payload[8:12], uint32(length))
+
+		msg = NewPeerMsg(Request)
+		msg.SetPayload(payload)
+		if _, err := conn.Write(msg.Bytes()); err != nil {
+			return err
+		}
+
+		msg, err = readPeerMsg(conn, Piece)
+		if err != nil {
+			return err
+		}
+
+		if msg.length > 0 {
+			piece = append(piece, msg.payload[8:msg.length]...)
+		}
+	}
+
+	h := sha1.New()
+	h.Write(piece)
+	hsum := string(h.Sum(nil))
+	if hsum != torrentPieceHash {
+		return fmt.Errorf("piece hash mistmatch (%x != %x)", hsum, torrentPieceHash)
+	}
+
+	if err := os.WriteFile(outputFile, piece, 0644); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+type PeerMsgId byte
+
+const (
+	Choke PeerMsgId = 0
+	Unchoke PeerMsgId = 1
+	Interested PeerMsgId = 2
+	BitField PeerMsgId = 5
+	Request PeerMsgId = 6
+	Piece PeerMsgId = 7
+)
+
+func (p *PeerMsgId) String() string {
+	switch *p {
+	case Unchoke:
+		return "Unchoke"
+	case Interested:
+		return "Interested"
+	case BitField:
+		return "BitField"
+	case Request:
+		return "Request"
+	case Piece:
+		return "Piece"
+	default:
+		return "Unknown"
+	}
+}
+
+type PeerMsg struct {
+	length uint32
+	id PeerMsgId
+	payload []byte
+}
+
+func NewPeerMsg(id PeerMsgId) PeerMsg {
+	return PeerMsg {
+		length: 1,
+		id: id,
+		payload: nil,
+	}
+}
+
+func (msg *PeerMsg) SetPayload(payload []byte) {
+	msg.length = uint32(len(payload) + 1)
+	msg.payload = payload
+}
+
+func (msg *PeerMsg) Bytes() []byte {
+	bytes := make([]byte, 5)
+	binary.BigEndian.PutUint32(bytes, msg.length)
+	bytes[4] = byte(msg.id)
+	bytes = append(bytes, msg.payload...)
+	return bytes
+}
+
+func readPeerMsg(conn net.Conn, expected PeerMsgId) (PeerMsg, error) {
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(conn, hdr); err != nil {
+		return PeerMsg{}, nil
+	}
+
+	length := binary.BigEndian.Uint32(hdr[0:4]) - 1
+	id := PeerMsgId(hdr[4])
+
+	if id != expected {
+		return PeerMsg{}, fmt.Errorf("unexpected peer message id (%s != %s)", id.String(), expected.String())
+	}
+
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		return PeerMsg{}, nil
+	}
+
+	return PeerMsg{length: length, id: id, payload: payload}, nil
 }
 
 func main() {
 	command := os.Args[1]
 
-	if command == "decode" {
+	switch command {
+	case "decode":
 		bencodedValue := bufio.NewReader(strings.NewReader(os.Args[2]))
 
 		decoded, err := decodeBencode(bencodedValue)
@@ -429,7 +612,7 @@ func main() {
 
 		jsonOutput, _ := json.Marshal(decoded)
 		fmt.Println(string(jsonOutput))
-	} else if command == "info" {
+	case "info":
 		if len(os.Args) < 3 {
 			log.Fatalf("usage: %s %s filename\n", os.Args[0], command)
 		}
@@ -440,7 +623,7 @@ func main() {
 		}
 
 		fmt.Print(metainfo)
-	} else if command == "peers" {
+	case "peers":
 		if len(os.Args) < 3 {
 			log.Fatalf("usage: %s %s filename\n", os.Args[0], command)
 		}
@@ -448,7 +631,7 @@ func main() {
 		if err := listPeers(os.Args[2]); err != nil {
 			log.Fatal(err)
 		}
-	} else if command == "handshake" {
+	case "handshake":
 		if len(os.Args) < 4 {
 			log.Fatalf("usage: %s %s filename peer_ip:peer_port\n", os.Args[0], command)
 		}
@@ -456,8 +639,20 @@ func main() {
 		if err := handshake(os.Args[2], os.Args[3]); err != nil {
 			log.Fatal(err)
 		}
-	} else {
-		fmt.Println("Unknown command: " + command)
-		os.Exit(1)
+	case "download_piece":
+		if len(os.Args) < 5 {
+			log.Fatalf("usage: %s %s -o piece_filename torrent_file piece_num\n", os.Args[0], command)
+		}
+
+		pieceNum, err := strconv.Atoi(os.Args[5])
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if err := download_piece(os.Args[3], os.Args[4], pieceNum); err != nil {
+			log.Fatal(err)
+		}
+	default:
+		log.Fatal("Unknown command: " + command)
 	}
 }
